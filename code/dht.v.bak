@@ -1,0 +1,185 @@
+module t2a_dht(
+    input clk_50M,
+    input reset,
+    inout sensor,
+
+    output reg [7:0] T_integral,
+    output reg [7:0] RH_integral,
+    output reg [7:0] T_decimal,
+    output reg [7:0] RH_decimal,
+    output reg [7:0] Checksum,
+    output reg data_valid
+);
+
+//////////////////DO NOT MAKE ANY CHANGES ABOVE THIS LINE //////////////////
+
+// ----------------------------------------------------
+// Bidirectional I/O
+// ----------------------------------------------------
+reg sensor_out;
+reg sensor_dir;    // 1 = drive, 0 = receive
+assign sensor = sensor_dir ? sensor_out : 1'bz;
+wire sensor_in = sensor;
+
+// ----------------------------------------------------
+// State Machine (3 bits sufficient for 8 states)
+// ----------------------------------------------------
+localparam IDLE             = 3'd0;
+localparam START            = 3'd1;
+localparam WAIT_RESP_LOW    = 3'd2;
+localparam WAIT_RESP_HIGH   = 3'd3;
+localparam READ_LOW         = 3'd4;
+localparam READ_HIGH        = 3'd5;
+localparam CHECK            = 3'd6;
+localparam DONE             = 3'd7;
+
+reg [2:0] state;
+
+// Optimized counters - sized to actual needs
+reg [19:0] cnt;        // Max 900000 needs 20 bits (was 32)
+reg [5:0] bit_index;   // Max 40 needs 6 bits (was 32)
+reg [39:0] data_out;
+
+// Wire for checksum calculation (no register needed)
+wire checksum_valid = (data_out[7:0] == 
+                      ((data_out[39:32] + data_out[31:24] +
+                        data_out[23:16] + data_out[15:8]) & 8'hFF));
+
+// ----------------------------------------------------
+// RESET + MAIN FSM
+// ----------------------------------------------------
+always @(posedge clk_50M) begin
+    if (!reset) begin
+        state       <= IDLE;
+        sensor_dir  <= 1'b1;
+        sensor_out  <= 1'b1;
+
+        cnt         <= 20'd0;
+        bit_index   <= 6'd0;
+        data_out    <= 40'd0;
+        data_valid  <= 1'b0;
+
+        T_integral  <= 8'd0;
+        RH_integral <= 8'd0;
+        T_decimal   <= 8'd0;
+        RH_decimal  <= 8'd0;
+        Checksum    <= 8'd0;
+    end else begin
+
+        case(state)
+
+        // ----------------------------------------------------
+        // 18 ms LOW start signal
+        // ----------------------------------------------------
+        IDLE: begin
+            data_valid <= 1'b0;
+
+            sensor_dir <= 1'b1;
+            sensor_out <= 1'b0;   // drive low
+
+            cnt <= cnt + 20'd1;
+            if (cnt >= 20'd900000) begin   // 18 ms
+                sensor_out <= 1'b1;   // release HIGH
+                cnt <= 20'd0;
+                state <= START;
+            end
+        end
+
+        // ----------------------------------------------------
+        // Sensor will pull line LOW shortly
+        // ----------------------------------------------------
+        START: begin
+            sensor_dir <= 1'b0;   // release line (input)
+
+            if (sensor_in == 1'b0) begin
+                cnt <= 20'd0;
+                state <= WAIT_RESP_LOW;
+            end
+        end
+
+        // ----------------------------------------------------
+        // DHT11 pulls LOW for 80us
+        // ----------------------------------------------------
+        WAIT_RESP_LOW: begin
+            cnt <= cnt + 20'd1;
+
+            if ((sensor_in == 1'b1) && (cnt > 20'd4000)) begin
+                cnt <= 20'd0;
+                state <= WAIT_RESP_HIGH;
+            end
+        end
+
+        // ----------------------------------------------------
+        // DHT11 pulls HIGH for 80us → then bits begin
+        // ----------------------------------------------------
+        WAIT_RESP_HIGH: begin
+            cnt <= cnt + 20'd1;
+
+            if ((sensor_in == 1'b0) && (cnt > 20'd4000)) begin
+                cnt <= 20'd0;
+                bit_index <= 6'd0;
+                state <= READ_LOW;
+            end
+        end
+
+        // ----------------------------------------------------
+        // Each bit starts with ~50us LOW
+        // ----------------------------------------------------
+        READ_LOW: begin
+            if (bit_index >= 6'd40) begin
+                state <= CHECK;
+                cnt <= 20'd0;
+            end else begin
+                cnt <= cnt + 20'd1;
+                if ((sensor_in == 1'b1) && (cnt > 20'd2000)) begin
+                    cnt <= 20'd0;
+                    state <= READ_HIGH;
+                end
+            end
+        end
+
+        // ----------------------------------------------------
+        // Measure HIGH time → determines 0 or 1
+        // ----------------------------------------------------
+        READ_HIGH: begin
+            if (sensor_in == 1'b1)
+                cnt <= cnt + 20'd1;
+            else begin
+                data_out[39-bit_index] <= (cnt >= 20'd2000) ? 1'b1 : 1'b0;
+
+                bit_index <= bit_index + 6'd1;
+                cnt <= 20'd0;
+                state <= READ_LOW;
+            end
+        end
+
+        // ----------------------------------------------------
+        // Verify checksum (using wire, no state storage)
+        // ----------------------------------------------------
+        CHECK: begin
+            state <= DONE;
+        end
+
+        // ----------------------------------------------------
+        // Output all values
+        // ----------------------------------------------------
+        DONE: begin
+            RH_integral <= data_out[39:32];
+            RH_decimal  <= data_out[31:24];
+            T_integral  <= data_out[23:16];
+            T_decimal   <= data_out[15:8];
+            Checksum    <= data_out[7:0];
+
+            data_valid <= checksum_valid;  // Use wire directly
+
+            state <= IDLE;
+            cnt <= 20'd0;
+        end
+
+        endcase
+    end
+end
+
+//////////////////DO NOT MAKE ANY CHANGES BELOW THIS LINE //////////////////
+
+endmodule

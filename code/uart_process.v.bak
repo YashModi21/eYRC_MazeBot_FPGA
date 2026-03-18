@@ -1,0 +1,338 @@
+`timescale 1ns / 1ps
+
+module uart_process(
+    input clk_50M,
+    input clk_3125KHz,
+    input reset,
+    input ir_all,
+    input uart_rx_in,
+    input dout,              // Moisture sensor data output
+    inout dht_sensor,
+    output adc_cs_n,         // Moisture sensor control
+    output din,
+    output adc_sck,
+    output servo1_pwm,       // Servo control outputs
+    output servo2_pwm,
+    output uart_tx_out
+);
+
+    // ============================================================
+    // DHT Module Instantiation
+    // ============================================================
+    wire [7:0] T_integral, RH_integral, T_decimal, RH_decimal, Checksum;
+    wire dht_valid;
+    
+    dht dht0(
+        .clk_50M(clk_50M),
+        .reset(reset),
+        .sensor(dht_sensor),
+        .T_integral(T_integral),
+        .RH_integral(RH_integral),
+        .T_decimal(T_decimal),
+        .RH_decimal(RH_decimal),
+        .Checksum(Checksum),
+        .data_valid(dht_valid)
+    );
+    
+    // ============================================================
+    // Moisture Sensor Module Instantiation
+    // ============================================================
+    wire [11:0] moisture_value;
+    wire [7:0] moisture_led;
+    
+    moisture_sensor moisture_inst(
+        .dout(dout),
+        .clk50(clk_50M),
+        .adc_cs_n(adc_cs_n),
+        .din(din),
+        .adc_sck(adc_sck),
+        .d_out_ch0(moisture_value),
+        .led_ind(moisture_led)
+    );
+    
+    // ============================================================
+    // Servo Control Signals
+    // ============================================================
+    reg servo_move_down = 1'b0;
+    reg servo_move_up = 1'b0;
+    
+    // ============================================================
+    // Servo Control Module Instantiation
+    // ============================================================
+    servo_control servo_inst(
+        .clk_50M(clk_50M),
+        .reset(reset),
+        .move_down(servo_move_down),
+        .move_up(servo_move_up),
+        .servo1_pwm(servo1_pwm),
+        .servo2_pwm(servo2_pwm)
+    );
+    
+    // ============================================================
+    // ASCII Decimal Encoder for Temperature and Humidity
+    // ============================================================
+    wire [7:0] t_int_h, t_int_t, t_int_o;
+    wire [7:0] t_dec_h, t_dec_t, t_dec_o;
+    wire [7:0] rh_int_h, rh_int_t, rh_int_o;
+    wire [7:0] rh_dec_h, rh_dec_t, rh_dec_o;
+    
+    ascii_decimal ascii_t_int(.value(T_integral), .ascii_hundreds(t_int_h), .ascii_tens(t_int_t), .ascii_ones(t_int_o));
+    ascii_decimal ascii_t_dec(.value(T_decimal), .ascii_hundreds(t_dec_h), .ascii_tens(t_dec_t), .ascii_ones(t_dec_o));
+    ascii_decimal ascii_rh_int(.value(RH_integral), .ascii_hundreds(rh_int_h), .ascii_tens(rh_int_t), .ascii_ones(rh_int_o));
+    ascii_decimal ascii_rh_dec(.value(RH_decimal), .ascii_hundreds(rh_dec_h), .ascii_tens(rh_dec_t), .ascii_ones(rh_dec_o));
+    
+    // ============================================================
+    // Moisture Percentage Calculation and ASCII Encoding
+    // ============================================================
+    // Convert 12-bit value (0-4095) to percentage (0-100)
+    // Formula: (moisture_value / 4095) * 100
+    wire [18:0] moisture_scaled = moisture_value * 19'd100;  // 12-bit * 100 requires 19 bits
+    wire [6:0] moisture_percentage = moisture_scaled >> 12;  // divide by 4096 (equivalent to /4095)
+    wire [7:0] m_h, m_t, m_o;
+    
+    ascii_decimal ascii_moisture(.value({1'b0, moisture_percentage}), .ascii_hundreds(m_h), .ascii_tens(m_t), .ascii_ones(m_o));
+
+    // ============================================================
+    // Synchronize ir_all from clk_50M to clk_3125KHz
+    // ============================================================
+    reg ir_all_meta = 1'b0;
+    reg ir_all_sync = 1'b0;
+    reg ir_all_last = 1'b0;
+    
+    always @(posedge clk_3125KHz) begin
+        ir_all_meta <= ir_all;
+        ir_all_sync <= ir_all_meta;
+        ir_all_last <= ir_all_sync;
+    end
+    
+    wire ir_all_edge = ir_all_sync && !ir_all_last;
+
+    // ============================================================
+    // FSM in clk_3125KHz domain (like uart_middle)
+    // ============================================================
+    
+    localparam S_IDLE = 4'd0, S_HOLD_SERVO = 4'd1, S_INTRO = 4'd2, S_TEMP = 4'd3, S_HUMID = 4'd4, S_MOIST = 4'd5;
+    localparam S_SEND_TRIGGER = 4'd6, S_SEND_START = 4'd7, S_SEND_WAIT = 4'd8, S_DONE = 4'd9;
+    
+    reg [3:0] state = S_IDLE;
+    reg [7:0] tx_data = 8'd0;
+    reg tx_start = 1'b0;
+    reg [3:0] byte_counter = 0;
+    
+    // Packet buffers - each line is 10 bytes
+    reg [7:0] packet_line [0:3][0:9];  // 4 lines, 10 bytes each
+    reg [1:0] line_counter = 0;  // which line to send
+    
+    // UART signals
+    wire [7:0] rx_msg;
+    wire rx_parity;
+    wire rx_complete;
+    wire tx_done;
+    wire parity_type = 1'b0;  // Even parity
+    
+    // Hold servo counter (10 seconds at clk_50M)
+    reg [28:0] hold_servo_counter = 0;
+    localparam HOLD_SERVO_TIME = 29'd500000000;  // 10 seconds at 50MHz (2 sec × 5)
+    
+    // Synchronize dht_valid to clk_3125KHz (commented out - using latest DHT values)
+    // reg dht_valid_meta = 1'b0;
+    // reg dht_valid_sync = 1'b0;
+    // reg dht_valid_last = 1'b0;
+    // wire dht_valid_pulse = dht_valid_sync && !dht_valid_last;
+    // 
+    // always @(posedge clk_3125KHz) begin
+    //     dht_valid_meta <= dht_valid;
+    //     dht_valid_sync <= dht_valid_meta;
+    //     dht_valid_last <= dht_valid_sync;
+    // end
+    
+    always @(posedge clk_3125KHz or negedge reset) begin
+        if (!reset) begin
+            state <= S_IDLE;
+            tx_data <= 8'd0;
+            tx_start <= 1'b0;
+            byte_counter <= 0;
+            line_counter <= 0;
+        end
+        else begin
+            case (state)
+                S_IDLE: begin
+                    tx_start <= 1'b0;
+                    servo_move_down <= 1'b0;
+                    servo_move_up <= 1'b0;
+                    hold_servo_counter <= 0;
+                    if (ir_all_edge) begin
+                        // Start servo moving down on IR detection
+                        servo_move_down <= 1'b1;
+                        state <= S_HOLD_SERVO;
+                    end
+                end
+                
+                S_HOLD_SERVO: begin
+                    // Hold servo for 2 seconds (reading DHT), use latest DHT values
+                    // Counter increments at clk_3125KHz, so divide by 16 to get clk_50M equivalent
+                    // Increment by 16 per clk_3125KHz cycle to match 50MHz timing
+                    hold_servo_counter <= hold_servo_counter + 28'd16;
+                    
+                    if (hold_servo_counter >= HOLD_SERVO_TIME) begin
+                        hold_servo_counter <= 0;
+                        state <= S_INTRO;
+                    end
+                end
+                
+                S_INTRO: begin
+                    // Clear servo down signal and start moving servo up
+                    servo_move_down <= 1'b0;
+                    servo_move_up <= 1'b1;
+                    
+                    // Prepare line 0: "__MPI__\r\n" (10 bytes)
+                    packet_line[0][0] <= 8'h5F;  // '_'
+                    packet_line[0][1] <= 8'h5F;  // '_'
+                    packet_line[0][2] <= 8'h4D;  // 'M'
+                    packet_line[0][3] <= 8'h50;  // 'P'
+                    packet_line[0][4] <= 8'h49;  // 'I'
+                    packet_line[0][5] <= 8'h5F;  // '_'
+                    packet_line[0][6] <= 8'h5F;  // '_'
+                    packet_line[0][7] <= 8'h0D;  // CR
+                    packet_line[0][8] <= 8'h0A;  // LF
+                    packet_line[0][9] <= 8'h20;  // Space (padding)
+                    
+                    line_counter <= 0;
+                    byte_counter <= 0;
+                    state <= S_SEND_TRIGGER;
+                end
+                
+                S_TEMP: begin
+                    // Start servo moving up while sending temperature
+                    servo_move_up <= 1'b1;
+                    
+                    // Prepare line 1: "T:XX.XX C\n" (10 bytes - Temperature in Celsius)
+                    packet_line[1][0] <= 8'h54;       // 'T'
+                    packet_line[1][1] <= 8'h3A;       // ':'
+                    packet_line[1][2] <= t_int_t;     // tens digit
+                    packet_line[1][3] <= t_int_o;     // ones digit
+                    packet_line[1][4] <= 8'h2E;       // '.'
+                    packet_line[1][5] <= t_dec_t;     // tens digit
+                    packet_line[1][6] <= t_dec_o;     // ones digit
+                    packet_line[1][7] <= 8'h43;       // 'C'
+                    packet_line[1][8] <= 8'h0A;       // '\n'
+                    packet_line[1][9] <= 8'h20;       // Space (padding)
+                    
+                    line_counter <= 1;
+                    byte_counter <= 0;
+                    state <= S_SEND_TRIGGER;
+                end
+                
+                S_HUMID: begin
+                    // Prepare line 2: "RH:XX.XX%\n" (10 bytes - Humidity with RH label and % symbol)
+                    packet_line[2][0] <= 8'h52;       // 'R'
+                    packet_line[2][1] <= 8'h48;       // 'H'
+                    packet_line[2][2] <= 8'h3A;       // ':'
+                    packet_line[2][3] <= rh_int_t;    // tens digit
+                    packet_line[2][4] <= rh_int_o;    // ones digit
+                    packet_line[2][5] <= 8'h2E;       // '.'
+                    packet_line[2][6] <= rh_dec_t;    // tens digit
+                    packet_line[2][7] <= rh_dec_o;    // ones digit
+                    packet_line[2][8] <= 8'h25;       // '%'
+                    packet_line[2][9] <= 8'h0A;       // '\n'
+                    
+                    line_counter <= 2;
+                    byte_counter <= 0;
+                    state <= S_SEND_TRIGGER;
+                end
+                
+                S_MOIST: begin
+                    // Prepare line 3: "M:XXX% \n\n" (10 bytes - Moisture percentage)
+                    packet_line[3][0] <= 8'h4D;       // 'M'
+                    packet_line[3][1] <= 8'h3A;       // ':'
+                    packet_line[3][2] <= m_h;         // hundreds digit (0 or 1)
+                    packet_line[3][3] <= m_t;         // tens digit
+                    packet_line[3][4] <= m_o;         // ones digit
+                    packet_line[3][5] <= 8'h25;       // '%'
+                    packet_line[3][6] <= 8'h20;       // Space
+                    packet_line[3][7] <= 8'h0A;       // '\n'
+                    packet_line[3][8] <= 8'h0A;       // '\n' (extra newline for spacing)
+                    packet_line[3][9] <= 8'h20;       // Space (padding)
+                    
+                    line_counter <= 3;
+                    byte_counter <= 0;
+                    state <= S_SEND_TRIGGER;
+                end
+                
+                S_SEND_TRIGGER: begin
+                    // Set data first, then tx_start in next state
+                    tx_data <= packet_line[line_counter][byte_counter];
+                    state <= S_SEND_START;
+                end
+                
+                S_SEND_START: begin
+                    // Assert tx_start for one cycle
+                    tx_start <= 1'b1;
+                    state <= S_SEND_WAIT;
+                end
+                
+                S_SEND_WAIT: begin
+                    // Clear tx_start and wait for tx_done
+                    tx_start <= 1'b0;
+                    
+                    if (tx_done) begin
+                        if (byte_counter < 9) begin
+                            // Send next byte in same line (10 bytes total: 0-9)
+                            byte_counter <= byte_counter + 1;
+                            state <= S_SEND_TRIGGER;
+                        end
+                        else begin
+                            // Line complete, move to next state
+                            case (line_counter)
+                                2'd0: state <= S_TEMP;
+                                2'd1: state <= S_HUMID;
+                                2'd2: state <= S_MOIST;
+                                2'd3: state <= S_DONE;
+                                default: state <= S_DONE;
+                            endcase
+                        end
+                    end
+                end
+                
+                S_DONE: begin
+                    // Clear servo signals
+                    servo_move_down <= 1'b0;
+                    servo_move_up <= 1'b0;
+                    
+                    // Wait until IRs are released
+                    if (!ir_all_sync) state <= S_IDLE;
+                end
+                
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+    
+    // ============================================================
+    // UART RX instantiation (receive from HC-05)
+    // ============================================================
+    
+    uart_rx uart_rx0(
+        .clk_3125(clk_3125KHz),
+        .rx(uart_rx_in),
+        .rx_msg(rx_msg),
+        .rx_parity(rx_parity),
+        .rx_complete(rx_complete)
+    );
+    
+    // ============================================================
+    // UART TX instantiation (send to HC-05)
+    // ============================================================
+    
+    uart_tx uart_tx0(
+        .clk_3125(clk_3125KHz),
+        .parity_type(parity_type),
+        .tx_start(tx_start),
+        .data(tx_data),
+        .tx(uart_tx_out),
+        .tx_done(tx_done)
+    );
+
+endmodule
+
+

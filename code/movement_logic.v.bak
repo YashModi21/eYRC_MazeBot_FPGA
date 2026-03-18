@@ -1,0 +1,848 @@
+`timescale 1ns / 1ps
+/*
+Module: Movement Logic Controller
+
+- Movement controller FSM for a maze-solving / wall-following robot.
+
+Inputs used:
+1) IR Sensors (active-low, debounced):
+   - ir_left, ir_right, ir_front  -> wall presence detection
+
+2) Ultrasonic Distance Sensors (mm):
+   - distance_left, distance_right, distance_front -> alignment + obstacle check
+
+3) Wheel Encoders:
+   - left_encoder_count, right_encoder_count -> forward distance + turn angle control
+
+Outputs:
+- motor_command (STOP / FORWARD / LEFT TURN / RIGHT TURN)
+- speed_left, speed_right (PWM duty values for motor speed control)
+- state_debug, turn_debug, op_debug for debugging
+
+Core Working:
+- Uses a main FSM (STOP_STATE, MOVE_STATE, LEFT_TURN, RIGHT_TURN, UTURN, FORWARD, WALL_FOLLOWING)
+- Turns are performed in 3 phases using a sub-FSM (FORWARD_BEFORE_TURN -> TURN -> FORWARD_AFTER_TURN)
+- Wall-following adjusts motor speeds using ultrasonic distance imbalance for better alignment.
+	
+*/
+
+
+module movement_logic (
+    input clk_50M,
+    input clk_3125KHz,
+    input reset,
+    
+    // IR sensor inputs (wall presence detection)
+    input ir_left,              // Left IR sensor
+    input ir_right,             // Right IR sensor
+	 input ir_front,             // Front IR sensor
+    
+    // Ultrasonic sensor distance inputs (in mm) for alignment
+    input [15:0] distance_left,
+    input [15:0] distance_right,
+    input [15:0] distance_front,
+    
+    // Encoder inputs for turning
+    input [19:0] left_encoder_count,
+    input [19:0] right_encoder_count,
+    
+    // Motor control outputs
+    output reg [2:0] motor_command,// command to motor driver
+    output reg [3:0] speed_left,   // left motor speed
+    output reg [3:0] speed_right,  // right motor speed
+    
+    // Soil sensing and UART control
+    output reg mpi_trigger,         // Signal to trigger MPI soil sensing
+    input mpi_complete,             // Signal from MPI when sensing is complete
+    
+    // Debug outputs
+    output reg [3:0] state_debug,
+	 output reg [2:0] turn_debug,
+	 output op_debug
+);
+
+// State definitions
+localparam STOP_STATE     = 4'b0000;
+localparam MOVE_STATE     = 4'b0001;
+localparam LEFT_TURN      = 4'b0010;
+localparam RIGHT_TURN     = 4'b0011;
+localparam UTURN          = 4'b0100;
+localparam FORWARD        = 4'b0101;
+localparam WALL_FOLLOWING = 4'b0110;
+
+// Turn state definitions
+localparam FORWARD_BEFORE_TURN = 3'b000;
+localparam TURN                = 3'b001;
+localparam MPI                 = 3'b010;
+localparam FORWARD_AFTER_TURN  = 3'b011;
+
+// Motor commands
+localparam MOTOR_STOP        = 3'b000;
+localparam MOTOR_FORWARD     = 3'b001;
+localparam MOTOR_BACKWARD    = 3'b010;
+localparam MOTOR_LEFT_TURN   = 3'b011;
+localparam MOTOR_RIGHT_TURN  = 3'b100;
+
+// Thresholds and parameters                      
+localparam FRONT_THRESHOLD        = 16'd260;    // threshold for front wall detection 
+localparam BEFORE_TURN_COUNT      = 16'd3100;   // encoder count before turning
+localparam AFTER_TURN_COUNT       = 16'd2030;   // encoder count after turning
+localparam TURN_90_COUNT          = 16'd1900;   // encoder count to measure turning     
+localparam TURN_180_COUNT         = 16'd3225;   //encoder count for u-turn
+localparam FORWARD_COUNT          = 16'd4960;   // encoder count for straight movement of one cell 
+
+// State and turn counters
+reg [3:0]  current_state = STOP_STATE;
+reg [29:0] state_counter = 0;
+reg [2:0]  turn_state = FORWARD_BEFORE_TURN;
+reg [19:0] left_enc_start = 0;
+reg [19:0] right_enc_start = 0;
+reg [7:0]  left_turn_count = 0 ;
+reg [7:0]  right_turn_count = 0;
+reg [2:0] lf_count = 0;
+reg [2:0] lr_count = 0;
+reg [2:0] rf_count = 0;
+reg uturn_flag = 0;
+reg front_flag = 0;
+reg side_flag =0;
+
+
+// Debounce IR sensors which indicate presence of wall
+reg ir_left_debounced = 0;
+reg ir_right_debounced = 0;
+reg ir_front_debounced = 0;
+reg [19:0] ir_left_counter = 0;
+reg [19:0] ir_right_counter = 0;
+reg [19:0] ir_front_counter = 0;
+localparam DEBOUNCE_THRESHOLD = 20'd100000;  // ~2ms debounce
+localparam AVG_DISTANCE = 9'd200;
+localparam TURN_SPEED = 4'd13;
+
+
+// Wall detection flags
+wire wall_front_detected = (distance_front < FRONT_THRESHOLD && distance_front > 4) ? 1 : 0;
+wire side_open = (distance_left >= 175 && distance_right >= 175) ? 1 : 0;
+assign op_debug = wall_front_detected;
+wire front_open = !wall_front_detected;
+
+// Speed 
+wire [3:0] speed_left_align, speed_right_align, speed_leftturn_left, speed_leftturn_right, speed_rightturn_left, speed_rightturn_right;
+
+//Apparent values to implement wall following during turns ( experimentally calculated , sum of distances calculated by both ir is 145mm
+wire [15:0] apparent_left = (200 - 55- distance_right)>0 ? (200 - 55 - distance_right) : distance_right;
+wire [15:0] apparent_right = (200 - 55 - distance_left)>0  ? (200 - 55 - distance_left) : distance_left;
+
+//PWM values for wall following
+assign speed_left_align = (distance_left < AVG_DISTANCE ) ? (15 - distance_left * 15/AVG_DISTANCE) : 6;
+assign speed_right_align = (distance_right < AVG_DISTANCE ) ? (15 - distance_right * 15/AVG_DISTANCE) : 6;
+
+//PWM values for left turn using apparent wall logic
+assign speed_leftturn_left = (apparent_left < AVG_DISTANCE) ? (15 - apparent_left * 15/AVG_DISTANCE) : 6;
+assign speed_leftturn_right= (distance_right < AVG_DISTANCE) ? (15 - distance_right * 15/AVG_DISTANCE) : 6;
+
+//PWM values for right turn using apparent wall logic
+assign speed_rightturn_left = (distance_left < AVG_DISTANCE) ? (15 - distance_left * 15/AVG_DISTANCE) : 6;
+assign speed_rightturn_right= (apparent_right < AVG_DISTANCE) ? (15 - apparent_right * 15/AVG_DISTANCE) : 6;
+
+
+// Encoder difference
+wire [19:0] left_delta = ((left_encoder_count - left_enc_start)>0) ? left_encoder_count - left_enc_start : 0;
+wire [19:0] right_delta = ((right_encoder_count - right_enc_start)>0) ? right_encoder_count - right_enc_start : 0;
+
+	// if ir_debounced value = 1 that implies wall detected
+	// Debounce IR sensors
+	always @(posedge clk_50M) begin
+		 // Debounce left IR sensor
+		 if (!ir_left) begin
+			  if (ir_left_counter < DEBOUNCE_THRESHOLD) begin
+					ir_left_counter <= ir_left_counter + 1;
+			  end else begin
+					ir_left_debounced <= 1;
+			  end
+		 end else begin
+			  ir_left_counter <= 0;
+			  ir_left_debounced <= 0;
+		 end
+		 
+		 // Debounce right IR sensor
+		 if (!ir_right) begin
+			  if (ir_right_counter < DEBOUNCE_THRESHOLD) begin
+					ir_right_counter <= ir_right_counter + 1;
+			  end else begin
+					ir_right_debounced <= 1;
+			  end
+		 end else begin
+			  ir_right_counter <= 0;
+			  ir_right_debounced <= 0;
+		 end
+		 
+		 // Debounce front
+		 if (!ir_front) begin
+			 if (ir_front_counter < DEBOUNCE_THRESHOLD) begin
+					ir_front_counter <= ir_front_counter + 1;
+			  end else begin
+					ir_front_debounced <= 1;
+			  end
+		 end else begin
+			  ir_front_counter <= 0;
+			  ir_front_debounced <= 0;
+		 end
+	end
+
+// Main control logic with hardcoding logic
+always @(posedge clk_50M) begin
+    if (!reset) begin
+        current_state <= STOP_STATE;
+        turn_state <= FORWARD_BEFORE_TURN;
+        motor_command <= MOTOR_STOP;
+        speed_left <= 4'd0;
+        speed_right <= 4'd0;
+        state_counter <= 0;
+        mpi_trigger <= 1'b0;
+        state_debug <= STOP_STATE;
+    end
+    else begin
+        state_debug <= current_state;
+        state_counter <= state_counter + 1;
+
+        case (current_state)
+            STOP_STATE: begin
+                motor_command <= MOTOR_STOP;
+                speed_left <= 4'd0;
+                speed_right <= 4'd0;
+                
+                // Wait for initialization and move to forward state
+                if (state_counter > 27'd10000000) begin  // Wait ~1s
+                    current_state <= MOVE_STATE;
+                    state_counter <= 0;
+                end
+            end 
+            
+				/*
+				MOVE_STATE:
+				- Main decision-making state (navigation brain).
+				- Reads debounced IR sensors + ultrasonic front distance to detect:
+					 * wall on left/right
+					 * wall ahead (wall_front_detected)
+					 * maze exit (all open)
+				- Based on wall combination, it selects next action:
+					 * LEFT_TURN / RIGHT_TURN (with encoder start reset)
+					 * WALL_FOLLOWING (when both side walls present)
+					 * FORWARD (special straight run case)
+					 * STOP (exit condition)
+				- Uses lf_count / lr_count / rf_count for hardcoded turn sequences
+				  (experiment-based tuning for specific maze paths).
+				*/
+
+            MOVE_STATE: begin
+                // if both walls detected, enter wall following
+               if (ir_left_debounced && ir_right_debounced ) begin
+						  motor_command <= MOTOR_STOP;
+						  speed_left <= 4'd0;
+						  speed_right <= 4'd0;
+						  state_counter <= 0;
+						  current_state <= WALL_FOLLOWING;  
+               end   
+               
+					// if left wall not detected, turn left provided other two walls are blocked
+               else if (!ir_left_debounced && ir_right_debounced && wall_front_detected) begin
+                    motor_command <= MOTOR_STOP;
+                    speed_left <= 4'd0;
+                    speed_right <= 4'd0;
+                    state_counter <= 0;
+                    left_enc_start  <= left_encoder_count;
+                    right_enc_start <= right_encoder_count;
+                    current_state <= LEFT_TURN;
+						  left_turn_count <= left_turn_count + 1;
+                    turn_state <= FORWARD_BEFORE_TURN;
+               end
+					
+					// if right wall not detected, turn left provided other two walls are blocked
+               else if (ir_left_debounced && !ir_right_debounced && wall_front_detected) begin
+                    motor_command <= MOTOR_STOP;
+                    speed_left <= 4'd0;
+                    speed_right <= 4'd0;
+                    state_counter <= 0;
+                    left_enc_start  <= left_encoder_count;
+                    right_enc_start <= right_encoder_count;
+                    current_state <= RIGHT_TURN;
+						  right_turn_count <= right_turn_count + 1;
+                    turn_state <= FORWARD_BEFORE_TURN;
+               end 
+					
+					// // for edge case
+					// else if (!ir_left_debounced && !ir_right_debounced && wall_front_detected)  begin
+					// 	  motor_command <= MOTOR_FORWARD;
+                    // speed_left <= TURN_SPEED;
+                    // speed_right <= TURN_SPEED;
+                    // state_counter <= 0;
+					// end
+					
+					// To stop after exiting the maze
+               else if (!ir_left_debounced && !ir_right_debounced && !wall_front_detected) begin
+                    motor_command <= MOTOR_STOP;
+                    speed_left <= 4'd0;
+                    speed_right <= 4'd0;
+                    state_counter <= 0;
+               end 
+					
+            end
+				
+				
+			  /*
+				LEFT_TURN:
+				- Performs a full left turn using turn_state FSM:
+				  1) FORWARD_BEFORE_TURN: move forward (encoder-based) to reach turning point
+				  2) TURN: rotate ~90° left using encoder count (TURN_90_COUNT)
+				  3) FORWARD_AFTER_TURN: move forward to stabilize and return to MOVE_STATE
+				- Uses ultrasonic-based PWM correction during forward phases for wall alignment.
+				- front_flag / side_flag slightly adjust turn + forward distances for smoother turns.
+				*/
+
+           LEFT_TURN: begin
+                case (turn_state) 
+                    FORWARD_BEFORE_TURN: begin
+						      if ( front_open) begin
+								      front_flag <= 1;
+										if ( right_delta <= BEFORE_TURN_COUNT - 500 ) begin
+											motor_command <= MOTOR_FORWARD;
+											speed_left <= speed_leftturn_left;
+											speed_right <= speed_leftturn_right;
+												 
+											if (ir_front_debounced) begin
+												 motor_command <= MOTOR_STOP;
+												 speed_left <= 4'd0;
+												 speed_right <= 4'd0;
+												 turn_state <= TURN;
+												 left_enc_start  <= left_encoder_count;
+												 right_enc_start <= right_encoder_count;
+												 state_counter <= 0;
+											end
+
+										end
+										else begin
+											motor_command <= MOTOR_STOP;
+											speed_left <= 4'd0;
+											speed_right <= 4'd0;
+											turn_state <= TURN;
+											left_enc_start  <= left_encoder_count;
+											right_enc_start <= right_encoder_count;
+											state_counter <= 0;
+										end
+								end
+								else if ( side_open ) begin
+								      side_flag <= 1;
+										if ( right_delta <= BEFORE_TURN_COUNT - 900 ) begin
+											motor_command <= MOTOR_FORWARD;
+											speed_left <= TURN_SPEED;
+											speed_right <= TURN_SPEED;
+												 
+											if (ir_front_debounced) begin
+												 motor_command <= MOTOR_STOP;
+												 speed_left <= 4'd0;
+												 speed_right <= 4'd0;
+												 turn_state <= TURN;
+												 left_enc_start  <= left_encoder_count;
+												 right_enc_start <= right_encoder_count;
+												 state_counter <= 0;
+											end
+
+										end
+										else begin
+											motor_command <= MOTOR_STOP;
+											speed_left <= 4'd0;
+											speed_right <= 4'd0;
+											turn_state <= TURN;
+											left_enc_start  <= left_encoder_count;
+											right_enc_start <= right_encoder_count;
+											state_counter <= 0;
+										end
+								end
+								else begin
+										if ( right_delta <= BEFORE_TURN_COUNT ) begin
+											motor_command <= MOTOR_FORWARD;
+											speed_left <= speed_leftturn_left;
+											speed_right <= speed_leftturn_right;
+											  
+											if (ir_front_debounced) begin
+												 motor_command <= MOTOR_STOP;
+												 speed_left <= 4'd0;
+												 speed_right <= 4'd0;
+												 turn_state <= TURN;
+												 left_enc_start  <= left_encoder_count;
+												 right_enc_start <= right_encoder_count;
+												 state_counter <= 0;
+											end
+
+										end
+										else begin
+											motor_command <= MOTOR_STOP;
+											speed_left <= 4'd0;
+											speed_right <= 4'd0;
+											turn_state <= TURN;
+											left_enc_start  <= left_encoder_count;
+											right_enc_start <= right_encoder_count;
+											state_counter <= 0;
+										end
+								end
+                    end
+                    TURN: begin
+						    if (side_flag) begin
+									if (state_counter > 27'd10000000) begin
+											if (right_delta <= TURN_90_COUNT + 450) begin
+												 motor_command <= MOTOR_LEFT_TURN;
+												 speed_left <= TURN_SPEED;
+												 speed_right <= TURN_SPEED;
+											end
+											else begin
+												 turn_state <= FORWARD_AFTER_TURN;
+												 left_enc_start  <= left_encoder_count;
+												 right_enc_start <= right_encoder_count;
+												 state_counter <= 0;
+										   end 
+								   end			
+	                   end
+							 else begin
+									 if (state_counter > 27'd10000000) begin
+											if (right_delta <= TURN_90_COUNT) begin
+												 motor_command <= MOTOR_LEFT_TURN;
+												 speed_left <= TURN_SPEED;
+												 speed_right <= TURN_SPEED;
+											end
+											else begin
+												 turn_state <= FORWARD_AFTER_TURN;
+												 left_enc_start  <= left_encoder_count;
+												 right_enc_start <= right_encoder_count;
+												 state_counter <= 0;
+										   end
+									  end		
+	                   end						 
+                    end  
+                    FORWARD_AFTER_TURN: begin
+							  if (front_flag) begin
+									if (right_delta <= AFTER_TURN_COUNT + 300) begin
+										 motor_command <= MOTOR_FORWARD;
+	                            speed_left <= TURN_SPEED;
+	                            speed_right <= TURN_SPEED;
+									end
+									else begin
+										 current_state <= MOVE_STATE;
+										 state_counter <= 0;
+										 front_flag <= 0;
+									end
+							  end
+							  else if (side_flag) begin
+									if (right_delta <= AFTER_TURN_COUNT + 600) begin
+										 motor_command <= MOTOR_FORWARD;
+	                            speed_left <= speed_leftturn_left;
+	                            speed_right <= speed_leftturn_right;
+									end
+									else begin
+										 current_state <= MOVE_STATE;
+										 state_counter <= 0;
+										 side_flag <= 0;
+									end
+							  end
+							  else begin
+									  if (right_delta <= AFTER_TURN_COUNT) begin
+										 motor_command <= MOTOR_FORWARD;
+										 speed_left <= speed_leftturn_left;
+										 speed_right <= speed_leftturn_right;
+									end
+									else begin
+										 current_state <= MOVE_STATE;
+										 state_counter <= 0;
+									end
+							  end 
+                    end  
+                endcase    
+           end    
+                
+					 
+					 /*
+					RIGHT_TURN:
+					- Performs a full right turn using turn_state FSM:
+					  1) FORWARD_BEFORE_TURN: move forward (encoder-based) to reach turning point
+					  2) TURN: rotate ~90° right using encoder count (TURN_90_COUNT)
+					  3) FORWARD_AFTER_TURN: move forward to stabilize and return to MOVE_STATE
+					- Uses ultrasonic-based PWM correction during forward phases for wall alignment.
+					- front_flag / side_flag slightly adjust turn + forward distances for smoother turns.
+					*/
+
+                RIGHT_TURN: begin
+                    case (turn_state) 
+                        FORWARD_BEFORE_TURN: begin
+                            if ( front_open) begin
+									       front_flag <= 1;
+											 if ( left_delta <= BEFORE_TURN_COUNT - 500) begin
+												  motor_command <= MOTOR_FORWARD;
+												  speed_left <= speed_rightturn_left;
+												  speed_right <= speed_rightturn_right;
+												  
+													if (ir_front_debounced) begin
+														 motor_command <= MOTOR_STOP;
+														 speed_left <= 4'd0;
+														 speed_right <= 4'd0;
+														 turn_state <= TURN;
+														 left_enc_start  <= left_encoder_count;
+														 right_enc_start <= right_encoder_count;
+														 state_counter <= 0; 
+													end
+													
+											 end
+											 else begin
+													  motor_command <= MOTOR_STOP;
+													  speed_left <= 4'd0;
+													  speed_right <= 4'd0;
+													  turn_state <= TURN;
+													  left_enc_start  <= left_encoder_count;
+													  right_enc_start <= right_encoder_count;	
+													  state_counter <= 0;  
+											 end
+									 end
+									 else if ( side_open) begin
+									       side_flag <= 1;
+											 if ( left_delta <= BEFORE_TURN_COUNT - 900) begin
+												  motor_command <= MOTOR_FORWARD;
+												  speed_left <= TURN_SPEED;
+											     speed_right <= TURN_SPEED;
+												  
+													if (ir_front_debounced) begin
+														 motor_command <= MOTOR_STOP;
+														 speed_left <= 4'd0;
+														 speed_right <= 4'd0;
+														 turn_state <= TURN;
+														 left_enc_start  <= left_encoder_count;
+														 right_enc_start <= right_encoder_count;
+														 state_counter <= 0; 
+													end
+													
+											 end
+											 else begin
+													  motor_command <= MOTOR_STOP;
+													  speed_left <= 4'd0;
+													  speed_right <= 4'd0;
+													  turn_state <= TURN;
+													  left_enc_start  <= left_encoder_count;
+													  right_enc_start <= right_encoder_count;	
+													  state_counter <= 0;  
+											 end
+									 end
+									 else begin
+											 if ( left_delta <= BEFORE_TURN_COUNT ) begin
+												  motor_command <= MOTOR_FORWARD;
+												  speed_left <= speed_rightturn_left;
+												  speed_right <= speed_rightturn_right;
+												  
+													if (ir_front_debounced) begin
+														 motor_command <= MOTOR_STOP;
+														 speed_left <= 4'd0;
+														 speed_right <= 4'd0;
+														 turn_state <= TURN;
+														 left_enc_start  <= left_encoder_count;
+														 right_enc_start <= right_encoder_count;
+														 state_counter <= 0; 
+													end
+													
+											 end
+											 else begin
+												 
+													  motor_command <= MOTOR_STOP;
+													  speed_left <= 4'd0;
+													  speed_right <= 4'd0;
+													  turn_state <= TURN;
+													  left_enc_start  <= left_encoder_count;
+													  right_enc_start <= right_encoder_count;	
+													  state_counter <= 0;  
+											 end
+									 end
+                        end
+                        TURN: begin
+								     if (side_flag == 1) begin
+											if (state_counter > 27'd10000000) begin
+												 if (left_delta <= TURN_90_COUNT + 450) begin
+													  motor_command <= MOTOR_RIGHT_TURN;
+													  speed_left <= TURN_SPEED;
+													  speed_right <= TURN_SPEED;
+												 end
+												 else begin
+													  turn_state <= FORWARD_AFTER_TURN;
+													  left_enc_start  <= left_encoder_count;
+													  right_enc_start <= right_encoder_count;
+													  state_counter <= 0; 
+												 end    
+											end
+							        end
+							        else begin
+											if (state_counter > 27'd10000000) begin
+												 if (left_delta <= TURN_90_COUNT) begin
+													  motor_command <= MOTOR_RIGHT_TURN;
+													  speed_left <= TURN_SPEED;
+													  speed_right <= TURN_SPEED;
+												 end
+												 else begin
+													  turn_state <= FORWARD_AFTER_TURN;
+													  left_enc_start  <= left_encoder_count;
+													  right_enc_start <= right_encoder_count;
+													  state_counter <= 0; 
+												 end    
+											end
+							        end		  
+                        end  
+                        FORWARD_AFTER_TURN: begin
+                            if (front_flag) begin
+											 if (left_delta <= AFTER_TURN_COUNT + 300) begin
+												  motor_command <= MOTOR_FORWARD;
+	                                   speed_left <= TURN_SPEED;
+												  speed_right <= TURN_SPEED;
+											 end
+											 else begin
+												  current_state <= MOVE_STATE;
+												  state_counter <= 0;
+												  front_flag <= 0;
+											 end
+									 end
+									 else if (side_flag) begin
+											 if (left_delta <= AFTER_TURN_COUNT + 600) begin
+												  motor_command <= MOTOR_FORWARD;
+	                                   speed_left <= speed_rightturn_left;
+												  speed_right <= speed_rightturn_right;
+											 end
+											 else begin
+												  current_state <= MOVE_STATE;
+												  state_counter <= 0;
+												  side_flag <= 0;
+											 end
+									 end
+									 else begin
+											 if (left_delta <= AFTER_TURN_COUNT) begin
+												  motor_command <= MOTOR_FORWARD;
+												  speed_left <= speed_rightturn_left;
+												  speed_right <= speed_rightturn_right;
+											 end
+											 else begin
+												  current_state <= MOVE_STATE;
+												  state_counter <= 0;
+											 end
+									 end
+                        end  
+                    endcase			  
+						 
+            end
+				
+				/*
+				UTURN:
+				- Executes a 180° turn when front + side walls are blocked (dead end).
+				- uturn_flag decides turning direction based on side distances:
+					 uturn_flag = 0 -> rotate left
+					 uturn_flag = 1 -> rotate right
+				- turn_state flow:
+				  1) FORWARD_BEFORE_TURN: short stop/delay for stability
+				  2) TURN: rotate ~180° using encoder count (TURN_180_COUNT)
+				  3) FORWARD_AFTER_TURN: move forward slightly, then return to MOVE_STATE
+				*/
+
+				
+				UTURN: begin
+					case (turn_state) 
+                    FORWARD_BEFORE_TURN: begin
+						      if( state_counter < 27'd10000000) begin
+										 motor_command <= MOTOR_STOP;
+										 speed_left <= 4'd0;
+										 speed_right <= 4'd0;
+										 state_counter <= state_counter + 1;
+										 
+                        end
+                        else begin
+								    turn_state <= TURN;
+									 state_counter <= 0;
+								    left_enc_start  <= left_encoder_count;
+									 right_enc_start <= right_encoder_count;
+									 uturn_flag <= (distance_left <= distance_right) ? 1 : 0;
+                        end
+                    end
+                    TURN: begin
+                       if (!uturn_flag) begin
+									if ( right_delta <= TURN_180_COUNT ) begin
+											  motor_command <= MOTOR_LEFT_TURN;
+											  speed_left <= TURN_SPEED ;
+											  speed_right <= TURN_SPEED ;
+									end	  
+									else begin
+										  motor_command <= MOTOR_STOP;
+										  speed_left <= 4'd0;
+										  speed_right <= 4'd0;
+										  turn_state <= MPI;
+										  state_counter <= 0;
+									end
+							  end	
+							  else begin
+									if ( left_delta <= TURN_180_COUNT ) begin
+											  motor_command <= MOTOR_RIGHT_TURN;
+											  speed_left <= TURN_SPEED ;
+											  speed_right <= TURN_SPEED ;
+									end	  
+									else begin
+										   motor_command <= MOTOR_STOP;
+										   speed_left <= 4'd0;
+											speed_right <= 4'd0;
+										   turn_state <= MPI;
+										   state_counter <= 0;
+									end
+							  end	          
+                    end 
+					 MPI: begin
+						   // MPI state - trigger soil sensing and wait for completion
+						   mpi_trigger <= 1'b1;
+						   
+						   if (mpi_complete) begin
+						       mpi_trigger <= 1'b0;
+						       turn_state <= FORWARD_AFTER_TURN;
+							       state_counter <= 0;
+							       left_enc_start  <= left_encoder_count;
+							       right_enc_start <= right_encoder_count;
+						   end
+					 end
+						 FORWARD_AFTER_TURN: begin
+						   if (uturn_flag) begin
+								if ( left_delta <= 1700)begin
+								   if (ir_left_debounced && ir_right_debounced) begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= speed_left_align;
+										speed_right <= speed_right_align;
+									end
+									else if (ir_left_debounced && !ir_right_debounced) begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= speed_rightturn_left;
+										speed_right <= speed_rightturn_right;
+									end
+									else if (!ir_left_debounced && ir_right_debounced) begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= speed_leftturn_left;
+										speed_right <= speed_leftturn_right;
+									end
+								   else begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= TURN_SPEED;
+										speed_right <= TURN_SPEED;
+								   end	
+								end
+								else begin
+										motor_command <= MOTOR_STOP;
+										speed_left <= 4'd0;
+										speed_right <= 4'd0;
+                              current_state <= MOVE_STATE;
+										state_counter <= 0;
+								end
+							end	
+							else begin
+								if ( right_delta <= 1700)begin
+								   if (ir_left_debounced && ir_right_debounced) begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= speed_left_align;
+										speed_right <= speed_right_align;
+									end
+									else if (ir_left_debounced && !ir_right_debounced) begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= speed_rightturn_left;
+										speed_right <= speed_rightturn_right;
+									end
+									else if (!ir_left_debounced && ir_right_debounced) begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= speed_leftturn_left;
+										speed_right <= speed_leftturn_right;
+									end
+								   else begin
+										motor_command <= MOTOR_FORWARD;
+										speed_left <= TURN_SPEED;
+										speed_right <= TURN_SPEED;
+								   end	
+								end
+								else begin
+										motor_command <= MOTOR_STOP;
+										speed_left <= 4'd0;
+										speed_right <= 4'd0;
+										current_state <= MOVE_STATE;
+										state_counter <= 0;
+								end
+							end
+						 end 
+                endcase  
+ 
+				end 
+				
+				/*
+				FORWARD:
+				- Moves straight for one complete cell distance using encoder count (FORWARD_COUNT).
+				- Uses TURN_SPEED for both motors.
+				- After reaching the encoder target, stops and returns to MOVE_STATE.
+				*/
+
+			   
+			   FORWARD: begin
+						if(uturn_flag) begin
+						   if ( left_delta <= FORWARD_COUNT ) begin
+									motor_command <= MOTOR_FORWARD;
+									speed_left <= TURN_SPEED;
+                           speed_right <= TURN_SPEED;
+							end
+							else begin
+									motor_command <= MOTOR_STOP;
+								   speed_left <= 4'd0;
+									speed_right <= 4'd0;
+									current_state <= MOVE_STATE;
+									state_counter <= 0;
+							end
+						end
+						else begin
+							 if ( right_delta <= FORWARD_COUNT ) begin
+									motor_command <= MOTOR_FORWARD;
+									speed_left <= TURN_SPEED;
+                           speed_right <= TURN_SPEED;
+							end
+							else begin
+									motor_command <= MOTOR_STOP;
+								   speed_left <= 4'd0;
+									speed_right <= 4'd0;
+									current_state <= MOVE_STATE;
+									state_counter <= 0;
+							end
+						end
+			   end
+			   
+				/*
+				WALL_FOLLOWING:
+				- Activated when both left and right walls are detected by IR sensors.
+				- Robot moves forward while aligning between walls using ultrasonic PWM correction:
+					 speed_left  = speed_left_align
+					 speed_right = speed_right_align
+				- If front + left + right walls are detected (dead end), robot stops and enters UTURN.
+				- If side-wall condition breaks, robot stops wall-following and returns to MOVE_STATE.
+				*/
+            WALL_FOLLOWING: begin
+						  if (ir_front_debounced && ir_left_debounced && ir_right_debounced) begin
+								motor_command <= MOTOR_STOP;
+								speed_left <= 4'd0;
+								speed_right <= 4'd0;
+								current_state <= UTURN;
+								state_counter <= 0;
+								turn_state <= FORWARD_BEFORE_TURN;
+						  end
+						  else if (ir_left_debounced && ir_right_debounced ) begin
+								motor_command <= MOTOR_FORWARD;
+							   speed_left <= speed_left_align;
+							   speed_right <= speed_right_align;
+							   state_counter <= 0;
+						  end
+						  else begin
+							  motor_command <= MOTOR_STOP;
+							  speed_left <= 4'd0;
+							  speed_right <= 4'd0;
+							  state_counter <= 0;
+							  current_state <= MOVE_STATE;
+						  end	
+				end
+        endcase    
+    end        
+end    
+endmodule

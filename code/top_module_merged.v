@@ -1,0 +1,216 @@
+`timescale 1ns / 1ps
+
+/*
+Module: Complete Maze Robot Top Level
+Integrates wall-following movement with soil sensing/UART subsystem:
+- Movement control (encoders, ultrasonic, IR sensors, motors)
+- Soil sensing in MPI state (DHT, moisture sensor, servo, UART transmission)
+*/
+
+module top_module_merged(
+    input clk_50M,                // 50MHz input clock from FPGA (R8)
+    input reset,                  // Active low reset (button)
+    
+    // IR Sensor Inputs (wall detection)
+    input IR_1,                   // Left IR sensor (Pin C6)
+    input IR_2,                   // Right IR sensor (Pin D6)
+    input IR_3,                   // Front IR sensor (Pin D12)
+    
+    // Ultrasonic Sensor for wall following 
+    input US_EC1,                 // Left ultrasonic echo (Pin D11)
+    output US_TR1,                // Left ultrasonic trigger (Pin B12)
+    input US_EC2,                 // Right ultrasonic echo (Pin E10)
+    output US_TR2,                // Right ultrasonic trigger (Pin B11)
+    input US_EC3,                 // Front ultrasonic echo (Pin F8)
+    output US_TR3,                // Front ultrasonic trigger (Pin E9)
+    
+    // Rotatory Encoder Inputs for turns and u-turns
+    input L_ENA_1,                 // Left motor encoder channel A (Pin J16)
+    input L_ENB_1,                 // Left motor encoder channel B (Pin M10)
+    input R_ENA_2,                 // Right motor encoder channel A (Pin L14)
+    input R_ENB_2,                 // Right motor encoder channel B (Pin N15)
+    
+    // Motor Driver Outputs (L298N)
+    output MD_ENA,                // ENA - PWM for left motor speed (Pin T15)
+    output MD_ENB,                // ENB - PWM for right motor speed (Pin F13)
+    output MD_IN1,                // IN1 - Direction control for left motor (Pin R11)
+    output MD_IN2,                // IN2 - Direction control for left motor (Pin T11)
+    output MD_IN3,                // IN3 - Direction control for right motor (Pin T12)
+    output MD_IN4,                // IN4 - Direction control for right motor (Pin T13)
+    
+    // Soil Sensing Inputs/Outputs
+    input uart_rx_in,             // UART RX from HC-05
+    output uart_tx_out,           // UART TX to HC-05
+    input dout,                   // Moisture sensor data (ADC output)
+    output adc_cs_n,              // ADC chip select
+    output din,                   // ADC data in (SPI)
+    output adc_sck,               // ADC clock (SPI)
+    output servo1_pwm,            // Servo 1 control (soil sensor position)
+    output servo2_pwm,            // Servo 2 control
+    inout dht_sensor,             // DHT temperature/humidity sensor
+    
+    // Debug Outputs 
+    output [3:0] state_debug,
+    output [2:0] turn_debug,
+    output [15:0] distance_left_debug,
+    output debug_rx_start_cmd,    // Debug: HIGH when 'A' received
+    output [15:0] distance_right_debug,
+    output [15:0] distance_front_debug,
+    output [19:0] encoder_left_debug,
+    output [19:0] encoder_right_debug,
+    output [3:0] debug_dfs_pos_x, // Debug: DFS X coordinate
+    output [3:0] debug_dfs_pos_y // Debug: DFS Y coordinate
+//    output [3:0] left_pwm,
+//    output [3:0] right_pwm,
+//    output op_debug,
+//    output [7:0] debug_rx_byte    // Debug: last received byte
+);
+
+
+// Internal Signals
+wire clk_3125KHz;
+wire [15:0] distance_left;
+wire [15:0] distance_right;
+wire [15:0] distance_front;
+wire [2:0] motor_command;
+wire [3:0] speed_left;
+wire [3:0] speed_right;
+wire [19:0] left_encoder_count;
+wire [19:0] right_encoder_count;
+wire mpi_trigger;
+wire exit_maze;
+wire mpi_complete;
+wire debug_rx_start_cmd_wire;  // 'A' command from UART to movement_logic
+
+
+// Frequency Scaling 
+frequency_scaling freq_scaler (
+    .clk_50M(clk_50M),
+    .clk_3125KHz(clk_3125KHz)
+);
+
+
+// Rotatory Encoders
+rotatory_encoder encoder_left (
+    .clk_50M(clk_50M),
+    .reset(reset),
+    .encoder_a(L_ENB_1),
+    .encoder_b(L_ENA_1),
+    .position_count(left_encoder_count),
+    .direction()
+);
+
+rotatory_encoder encoder_right (
+    .clk_50M(clk_50M),
+    .reset(reset),
+    .encoder_a(R_ENA_2),
+    .encoder_b(R_ENB_2),
+    .position_count(right_encoder_count),
+    .direction()
+);
+
+// Ultrasonic Sensors
+ultrasonic ultrasonic_left (
+    .clk_50M(clk_50M),
+    .reset(reset),
+    .echo_rx(US_EC1),
+    .trig(US_TR1),
+    .distance_out(distance_left)
+);
+
+ultrasonic ultrasonic_right (
+    .clk_50M(clk_50M),
+    .reset(reset),
+    .echo_rx(US_EC3),
+    .trig(US_TR3),
+    .distance_out(distance_right)
+);
+
+ultrasonic_refined ultrasonic_front (
+    .clk_50M(clk_50M),
+    .reset(reset),
+    .echo_rx(US_EC2),
+    .trig(US_TR2),
+    .distance_out(distance_front)
+);
+
+// Wall Following Movement Logic
+movement_logic wall_follower(
+    .clk_50M(clk_50M),
+    .clk_3125KHz(clk_3125KHz),
+    .reset(reset),
+    .ir_left(IR_1),
+    .ir_right(IR_2),
+    .ir_front(IR_3),
+    .distance_left(distance_left),
+    .distance_right(distance_right),
+    .distance_front(distance_front),
+    .left_encoder_count(left_encoder_count),
+    .right_encoder_count(right_encoder_count),
+    .motor_command(motor_command),
+    .speed_left(speed_left),
+    .speed_right(speed_right),
+    .mpi_trigger(mpi_trigger),
+    .exit_maze(exit_maze),
+    .mpi_complete(mpi_complete),
+    .debug_rx_start_cmd(debug_rx_start_cmd_wire),
+    .state_debug(state_debug),
+    .turn_debug(turn_debug),
+    .op_debug(op_debug),
+    .debug_dfs_pos_x(debug_dfs_pos_x),
+    .debug_dfs_pos_y(debug_dfs_pos_y)
+);
+
+
+// Motor Driver Controller
+
+motor_driver_l298n motor_driver (
+    .clk_3125KHz(clk_3125KHz),
+    .motor_command(motor_command),
+    .speed_left(speed_left),
+    .speed_right(speed_right),
+    .pwm_left_motor(MD_ENA),
+    .pwm_right_motor(MD_ENB),
+    .in1(MD_IN1),
+    .in2(MD_IN2),
+    .in4(MD_IN3),
+    .in3(MD_IN4)
+);
+
+
+// Soil Sensing and UART Subsystem
+uart_process soil_sensor(
+    .clk_50M(clk_50M),
+    .clk_3125KHz(clk_3125KHz),
+    .reset(reset),
+    .mpi_trigger(mpi_trigger),
+    .exit(exit_maze),
+    .mpi_complete(mpi_complete),
+    .uart_rx_in(uart_rx_in),
+    .uart_tx_out(uart_tx_out),
+    .dht_sensor(dht_sensor),
+    .dout(dout),
+    .adc_cs_n(adc_cs_n),
+    .din(din),
+    .adc_sck(adc_sck),
+    .servo1_pwm(servo1_pwm),
+    .servo2_pwm(servo2_pwm),
+    .x({{28{1'b0}}, debug_dfs_pos_x}),  // Extend 4-bit X to 32-bit
+    .y({{28{1'b0}}, debug_dfs_pos_y}),  // Extend 4-bit Y to 32-bit
+    .debug_rx_start_cmd(debug_rx_start_cmd),
+    .debug_rx_byte(debug_rx_byte)
+);
+
+// Wire debug command to movement logic
+assign debug_rx_start_cmd_wire = debug_rx_start_cmd;
+
+// Debug Outputs
+assign distance_front_debug = distance_front;
+assign distance_left_debug = distance_left;
+assign distance_right_debug = distance_right;
+assign encoder_left_debug = left_encoder_count;
+assign encoder_right_debug = right_encoder_count;
+assign left_pwm = speed_left;
+assign right_pwm = speed_right;
+
+endmodule
