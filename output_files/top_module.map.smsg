@@ -1,0 +1,4 @@
+Info (10281): Verilog HDL Declaration information at dfs.v(4): object "left" differs only in case from object "LEFT" in the same scope File: C:/Maze_Bot/mb_3314_task5a/code/dfs.v Line: 4
+Info (10281): Verilog HDL Declaration information at dfs.v(6): object "right" differs only in case from object "RIGHT" in the same scope File: C:/Maze_Bot/mb_3314_task5a/code/dfs.v Line: 6
+Info (10281): Verilog HDL Declaration information at dfs1.v(4): object "left" differs only in case from object "LEFT" in the same scope File: C:/Maze_Bot/mb_3314_task5a/code/dfs1.v Line: 4
+Info (10281): Verilog HDL Declaration information at dfs1.v(6): object "right" differs only in case from object "RIGHT" in the same scope File: C:/Maze_Bot/mb_3314_task5a/code/dfs1.v Line: 6
