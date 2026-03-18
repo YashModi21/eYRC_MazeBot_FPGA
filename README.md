@@ -1,6 +1,5 @@
-# eYRC_MazeBot_FPGA
+# eYRC_MazeBot_FPGA-Based Autonomous Maze Solver
 
-# Maze Bot - FPGA-Based Autonomous Maze Solver
 
 ## Project Overview
 
